@@ -3,7 +3,7 @@ use core::{cell::UnsafeCell, marker::PhantomData, mem, ptr::NonNull};
 use aya_bpf_cty::c_void;
 
 use crate::{
-    bindings::{bpf_map_def, bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY},
+    bindings::{bpf_map_def, bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY, bpf_map_type::BPF_MAP_TYPE_ARRAY_OF_MAPS},
     helpers::bpf_map_lookup_elem,
     maps::PinningType,
 };
