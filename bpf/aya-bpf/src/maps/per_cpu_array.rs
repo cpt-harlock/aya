@@ -23,7 +23,7 @@ impl<T> PerCpuArray<T> {
             def: UnsafeCell::new(bpf_map_def {
                 type_: BPF_MAP_TYPE_ARRAY_OF_MAPS,
                 key_size: mem::size_of::<u32>() as u32,
-                value_size: mem::size_of::<T>() as u32,
+                value_size: mem::size_of::<u32>() as u32,
                 max_entries,
                 map_flags: flags,
                 id: 0,
