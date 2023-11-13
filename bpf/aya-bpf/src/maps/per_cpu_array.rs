@@ -17,6 +17,22 @@ pub struct PerCpuArray<T> {
 unsafe impl<T> Sync for PerCpuArray<T> {}
 
 impl<T> PerCpuArray<T> {
+
+    pub const fn with_max_entries_array_of_maps(max_entries: u32, flags: u32) -> PerCpuArray<T> {
+        PerCpuArray {
+            def: UnsafeCell::new(bpf_map_def {
+                type_: BPF_MAP_TYPE_PERCPU_ARRAY,
+                key_size: mem::size_of::<u32>() as u32,
+                value_size: mem::size_of::<T>() as u32,
+                max_entries,
+                map_flags: flags,
+                id: 0,
+                pinning: PinningType::None as u32,
+            }),
+            _t: PhantomData,
+        }
+    }
+    
     pub const fn with_max_entries(max_entries: u32, flags: u32) -> PerCpuArray<T> {
         PerCpuArray {
             def: UnsafeCell::new(bpf_map_def {
