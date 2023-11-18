@@ -1,35 +1,35 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::anyhow;
+use aya_tool::{bindgen, write_to_file_fmt};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
-use std::path::PathBuf;
-
-use aya_gen::{
-    bindgen,
-    getters::{generate_getters_for_items, read_getter},
-    write_to_file_fmt,
-};
 use syn::{parse_str, Item};
 
 use crate::codegen::{
     helpers::{expand_helpers, extract_helpers},
-    Architecture, Options,
+    Architecture, SysrootOptions,
 };
 
-pub fn codegen(opts: &Options) -> Result<(), anyhow::Error> {
+pub fn codegen(opts: &SysrootOptions, libbpf_dir: &Path) -> Result<(), anyhow::Error> {
+    let SysrootOptions {
+        x86_64_sysroot,
+        aarch64_sysroot,
+        armv7_sysroot,
+        riscv64_sysroot,
+    } = opts;
+
     let dir = PathBuf::from("bpf/aya-bpf-bindings");
 
     let builder = || {
         let mut bindgen = bindgen::bpf_builder()
             .header(&*dir.join("include/bindings.h").to_string_lossy())
-            // aya-gen uses aya_bpf::cty. We can't use that here since aya-bpf
+            // aya-tool uses aya_bpf::cty. We can't use that here since aya-bpf
             // depends on aya-bpf-bindings so it would create a circular dep.
             .ctypes_prefix("::aya_bpf_cty")
-            .clang_args(&[
-                "-I",
-                &*opts.libbpf_dir.join("include/uapi").to_string_lossy(),
-            ])
-            .clang_args(&["-I", &*opts.libbpf_dir.join("include").to_string_lossy()])
-            .clang_args(&["-I", &*opts.libbpf_dir.join("src").to_string_lossy()])
+            .clang_args(&["-I", &*libbpf_dir.join("include/uapi").to_string_lossy()])
+            .clang_args(&["-I", &*libbpf_dir.join("include").to_string_lossy()])
+            .clang_args(&["-I", &*libbpf_dir.join("src").to_string_lossy()])
             // open aya-bpf-bindings/.../bindings.rs and look for mod
             // _bindgen, those are anonymous enums
             .constified_enum("BPF_F_.*")
@@ -46,11 +46,12 @@ pub fn codegen(opts: &Options) -> Result<(), anyhow::Error> {
             .constified_enum("BPF_FLOW_.*");
 
         let types = [
-            "bpf_map_.*",
+            "bpf_.*",
             "sk_action",
             "pt_regs",
+            "user_pt_regs",
+            "user_regs_struct",
             "xdp_action",
-            "bpf_adj_room_mode",
         ];
         let vars = ["BPF_.*", "bpf_.*", "TC_ACT_.*", "SOL_SOCKET", "SO_.*"];
 
@@ -70,9 +71,29 @@ pub fn codegen(opts: &Options) -> Result<(), anyhow::Error> {
     };
 
     for arch in Architecture::supported() {
-        let generated = dir.join("src").join(arch.to_string());
+        let mut bindgen = builder();
 
-        let bindings = builder()
+        // Set target triple. This will set the right flags (which you can see
+        // running clang -target=X  -E - -dM </dev/null)
+        let target = match arch {
+            Architecture::X86_64 => "x86_64-unknown-linux-gnu",
+            Architecture::ARMv7 => "armv7-unknown-linux-gnu",
+            Architecture::AArch64 => "aarch64-unknown-linux-gnu",
+            Architecture::RISCV64 => "riscv64-unknown-linux-gnu",
+        };
+        bindgen = bindgen.clang_args(&["-target", target]);
+
+        // Set the sysroot. This is needed to ensure that the correct arch
+        // specific headers are imported.
+        let sysroot = match arch {
+            Architecture::X86_64 => x86_64_sysroot,
+            Architecture::ARMv7 => armv7_sysroot,
+            Architecture::AArch64 => aarch64_sysroot,
+            Architecture::RISCV64 => riscv64_sysroot,
+        };
+        bindgen = bindgen.clang_args(&["-I", &*sysroot.to_string_lossy()]);
+
+        let bindings = bindgen
             .generate()
             .map_err(|_| anyhow!("bindgen failed"))?
             .to_string();
@@ -84,29 +105,17 @@ pub fn codegen(opts: &Options) -> Result<(), anyhow::Error> {
             tree.items[index] = Item::Verbatim(TokenStream::new())
         }
 
+        let generated = dir.join("src").join(arch.to_string());
         // write the bindings, with the original helpers removed
         write_to_file_fmt(
-            &generated.join("bindings.rs"),
+            generated.join("bindings.rs"),
             &tree.to_token_stream().to_string(),
         )?;
 
         // write the new helpers as expanded by expand_helpers()
         write_to_file_fmt(
-            &generated.join("helpers.rs"),
-            &format!("use super::bindings::*; {}", helpers.to_string()),
-        )?;
-
-        // write the bpf_probe_read() getters
-        let bpf_probe_read = syn::parse_str("crate::bpf_probe_read").unwrap();
-        write_to_file_fmt(
-            &generated.join("getters.rs"),
-            &format!(
-                "use super::bindings::*; {}",
-                &generate_getters_for_items(&tree.items, |getter| {
-                    read_getter(getter, &bpf_probe_read)
-                })
-                .to_string()
-            ),
+            generated.join("helpers.rs"),
+            &format!("use super::bindings::*; {helpers}"),
         )?;
     }
 

@@ -1,16 +1,15 @@
 use std::{
-    convert::TryFrom,
+    borrow::{Borrow, BorrowMut},
     marker::PhantomData,
-    ops::{Deref, DerefMut},
-    os::unix::io::{AsRawFd, RawFd},
+    os::fd::{AsFd as _, AsRawFd, RawFd},
 };
 
 use crate::{
-    generated::bpf_map_type::BPF_MAP_TYPE_SOCKHASH,
     maps::{
-        hash_map, sock::SocketMap, IterableMap, Map, MapError, MapIter, MapKeys, MapRef, MapRefMut,
+        check_kv_size, hash_map, sock::SockMapFd, IterableMap, MapData, MapError, MapFd, MapIter,
+        MapKeys,
     },
-    sys::bpf_map_lookup_elem,
+    sys::{bpf_map_lookup_elem, SyscallError},
     Pod,
 };
 
@@ -42,19 +41,22 @@ use crate::{
 /// #     Bpf(#[from] aya::BpfError)
 /// # }
 /// # let mut bpf = aya::Bpf::load(&[])?;
-/// use std::convert::{TryFrom, TryInto};
 /// use std::io::Write;
 /// use std::net::TcpStream;
-/// use std::os::unix::io::AsRawFd;
+/// use std::os::fd::AsRawFd;
 /// use aya::maps::SockHash;
 /// use aya::programs::SkMsg;
 ///
-/// let mut intercept_egress = SockHash::try_from(bpf.map_mut("INTERCEPT_EGRESS")?)?;
-/// let prog: &mut SkMsg = bpf.program_mut("intercept_egress_packet")?.try_into()?;
+/// let mut intercept_egress = SockHash::<_, u32>::try_from(bpf.map("INTERCEPT_EGRESS").unwrap())?;
+/// let map_fd = intercept_egress.fd().try_clone()?;
+///
+/// let prog: &mut SkMsg = bpf.program_mut("intercept_egress_packet").unwrap().try_into()?;
 /// prog.load()?;
-/// prog.attach(&intercept_egress)?;
+/// prog.attach(&map_fd)?;
 ///
 /// let mut client = TcpStream::connect("127.0.0.1:1234")?;
+/// let mut intercept_egress = SockHash::try_from(bpf.map_mut("INTERCEPT_EGRESS").unwrap())?;
+///
 /// intercept_egress.insert(1234, client.as_raw_fd(), 0)?;
 ///
 /// // the write will be intercepted
@@ -62,96 +64,84 @@ use crate::{
 /// # Ok::<(), Error>(())
 /// ```
 #[doc(alias = "BPF_MAP_TYPE_SOCKHASH")]
-pub struct SockHash<T: Deref<Target = Map>, K> {
-    inner: T,
+pub struct SockHash<T, K> {
+    pub(crate) inner: T,
     _k: PhantomData<K>,
 }
 
-impl<T: Deref<Target = Map>, K: Pod> SockHash<T, K> {
-    pub(crate) fn new(map: T) -> Result<SockHash<T, K>, MapError> {
-        let map_type = map.obj.def.map_type;
+impl<T: Borrow<MapData>, K: Pod> SockHash<T, K> {
+    pub(crate) fn new(map: T) -> Result<Self, MapError> {
+        let data = map.borrow();
+        check_kv_size::<K, u32>(data)?;
 
-        // validate the map definition
-        if map_type != BPF_MAP_TYPE_SOCKHASH as u32 {
-            return Err(MapError::InvalidMapType {
-                map_type: map_type as u32,
-            });
-        }
-        hash_map::check_kv_size::<K, u32>(&map)?;
-        let _ = map.fd_or_err()?;
-
-        Ok(SockHash {
+        Ok(Self {
             inner: map,
             _k: PhantomData,
         })
     }
 
     /// Returns the fd of the socket stored at the given key.
-    pub unsafe fn get(&self, key: &K, flags: u64) -> Result<RawFd, MapError> {
-        let fd = self.inner.deref().fd_or_err()?;
-        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(code, io_error)| {
-            MapError::SyscallError {
-                call: "bpf_map_lookup_elem".to_owned(),
-                code,
-                io_error,
-            }
+    pub fn get(&self, key: &K, flags: u64) -> Result<RawFd, MapError> {
+        let fd = self.inner.borrow().fd().as_fd();
+        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
+            call: "bpf_map_lookup_elem",
+            io_error,
         })?;
         value.ok_or(MapError::KeyNotFound)
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order. The
     /// iterator item type is `Result<(K, V), MapError>`.
-    pub unsafe fn iter(&self) -> MapIter<'_, K, RawFd> {
+    pub fn iter(&self) -> MapIter<'_, K, RawFd, Self> {
         MapIter::new(self)
     }
 
     /// An iterator visiting all keys in arbitrary order. The iterator element
     /// type is `Result<K, MapError>`.
-    pub unsafe fn keys(&self) -> MapKeys<'_, K> {
-        MapKeys::new(&self.inner)
+    pub fn keys(&self) -> MapKeys<'_, K> {
+        MapKeys::new(self.inner.borrow())
+    }
+
+    /// Returns the map's file descriptor.
+    ///
+    /// The returned file descriptor can be used to attach programs that work with
+    /// socket maps, like [`SkMsg`](crate::programs::SkMsg) and [`SkSkb`](crate::programs::SkSkb).
+    pub fn fd(&self) -> &SockMapFd {
+        let fd: &MapFd = self.inner.borrow().fd();
+        // TODO(https://github.com/rust-lang/rfcs/issues/3066): avoid this unsafe.
+        // SAFETY: `SockMapFd` is #[repr(transparent)] over `MapFd`.
+        unsafe { std::mem::transmute(fd) }
     }
 }
 
-impl<T: DerefMut<Target = Map>, K: Pod> SockHash<T, K> {
+impl<T: BorrowMut<MapData>, K: Pod> SockHash<T, K> {
     /// Inserts a socket under the given key.
-    pub fn insert<I: AsRawFd>(&mut self, key: K, value: I, flags: u64) -> Result<(), MapError> {
-        hash_map::insert(&mut self.inner, key, value.as_raw_fd(), flags)
+    pub fn insert<I: AsRawFd>(
+        &mut self,
+        key: impl Borrow<K>,
+        value: I,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        hash_map::insert(
+            self.inner.borrow_mut(),
+            key.borrow(),
+            &value.as_raw_fd(),
+            flags,
+        )
     }
 
     /// Removes a socket from the map.
     pub fn remove(&mut self, key: &K) -> Result<(), MapError> {
-        hash_map::remove(&mut self.inner, key)
+        hash_map::remove(self.inner.borrow_mut(), key)
     }
 }
 
-impl<T: Deref<Target = Map>, K: Pod> IterableMap<K, RawFd> for SockHash<T, K> {
-    fn map(&self) -> &Map {
-        &self.inner
+impl<T: Borrow<MapData>, K: Pod> IterableMap<K, RawFd> for SockHash<T, K> {
+    fn map(&self) -> &MapData {
+        self.inner.borrow()
     }
 
-    unsafe fn get(&self, key: &K) -> Result<RawFd, MapError> {
-        SockHash::get(self, key, 0)
-    }
-}
-
-impl<T: DerefMut<Target = Map>, K: Pod> SocketMap for SockHash<T, K> {
-    fn fd_or_err(&self) -> Result<RawFd, MapError> {
-        self.inner.fd_or_err()
-    }
-}
-
-impl<K: Pod> TryFrom<MapRef> for SockHash<MapRef, K> {
-    type Error = MapError;
-
-    fn try_from(a: MapRef) -> Result<SockHash<MapRef, K>, MapError> {
-        SockHash::new(a)
-    }
-}
-
-impl<K: Pod> TryFrom<MapRefMut> for SockHash<MapRefMut, K> {
-    type Error = MapError;
-
-    fn try_from(a: MapRefMut) -> Result<SockHash<MapRefMut, K>, MapError> {
-        SockHash::new(a)
+    fn get(&self, key: &K) -> Result<RawFd, MapError> {
+        Self::get(self, key, 0)
     }
 }

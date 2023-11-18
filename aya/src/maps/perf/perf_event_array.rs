@@ -2,22 +2,21 @@
 //!
 //! [`perf`]: https://perf.wiki.kernel.org/index.php/Main_Page.
 use std::{
-    convert::TryFrom,
-    ops::DerefMut,
-    os::unix::io::{AsRawFd, RawFd},
+    borrow::{Borrow, BorrowMut},
+    ops::Deref,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
     sync::Arc,
 };
 
 use bytes::BytesMut;
-use libc::{sysconf, _SC_PAGESIZE};
 
 use crate::{
-    generated::bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY,
     maps::{
         perf::{Events, PerfBuffer, PerfBufferError},
-        Map, MapError, MapRefMut,
+        MapData, MapError,
     },
     sys::bpf_map_update_elem,
+    util::page_size,
 };
 
 /// A ring buffer that can receive events from eBPF programs.
@@ -27,12 +26,12 @@ use crate::{
 ///
 /// See the [`PerfEventArray` documentation](PerfEventArray) for an overview of how to use
 /// perf buffers.
-pub struct PerfEventArrayBuffer<T: DerefMut<Target = Map>> {
+pub struct PerfEventArrayBuffer<T> {
     _map: Arc<T>,
     buf: PerfBuffer,
 }
 
-impl<T: DerefMut<Target = Map>> PerfEventArrayBuffer<T> {
+impl<T: BorrowMut<MapData>> PerfEventArrayBuffer<T> {
     /// Returns true if the buffer contains events that haven't been read.
     pub fn readable(&self) -> bool {
         self.buf.readable()
@@ -51,15 +50,18 @@ impl<T: DerefMut<Target = Map>> PerfEventArrayBuffer<T> {
     /// # Errors
     ///
     /// [`PerfBufferError::NoBuffers`] is returned when `out_bufs` is empty.
-    ///
-    /// [`PerfBufferError::MoreSpaceNeeded { size }`](PerfBufferError) is returned when the size of the events is
-    /// bigger than the size of the out_bufs provided.
     pub fn read_events(&mut self, out_bufs: &mut [BytesMut]) -> Result<Events, PerfBufferError> {
         self.buf.read_events(out_bufs)
     }
 }
 
-impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
+impl<T: BorrowMut<MapData>> AsFd for PerfEventArrayBuffer<T> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.buf.as_fd()
+    }
+}
+
+impl<T: BorrowMut<MapData>> AsRawFd for PerfEventArrayBuffer<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.buf.as_raw_fd()
     }
@@ -68,7 +70,7 @@ impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
 /// A map that can be used to receive events from eBPF programs using the linux [`perf`] API.
 ///
 /// Each element of a [`PerfEventArray`] is a separate [`PerfEventArrayBuffer`] which can be used
-/// to receive events sent by eBPF programs that use `bpf_perf_event_output()`.    
+/// to receive events sent by eBPF programs that use `bpf_perf_event_output()`.
 ///
 /// To receive events you need to:
 /// * call [`PerfEventArray::open`]
@@ -87,15 +89,15 @@ impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
 ///
 /// ```no_run
 /// # use aya::maps::perf::PerfEventArrayBuffer;
-/// # use aya::maps::Map;
-/// # use std::ops::DerefMut;
+/// # use aya::maps::MapData;
+/// # use std::borrow::BorrowMut;
 /// # struct Poll<T> { _t: std::marker::PhantomData<T> };
-/// # impl<T: DerefMut<Target=Map>> Poll<T> {
+/// # impl<T: BorrowMut<MapData>> Poll<T> {
 /// #    fn poll_readable(&self) -> &mut [PerfEventArrayBuffer<T>] {
 /// #        &mut []
 /// #    }
 /// # }
-/// # fn poll_buffers<T: DerefMut<Target=Map>>(bufs: Vec<PerfEventArrayBuffer<T>>) -> Poll<T> {
+/// # fn poll_buffers<T: BorrowMut<MapData>>(bufs: Vec<PerfEventArrayBuffer<T>>) -> Poll<T> {
 /// #    Poll { _t: std::marker::PhantomData }
 /// # }
 /// # #[derive(thiserror::Error, Debug)]
@@ -109,13 +111,12 @@ impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
 /// #    #[error(transparent)]
 /// #    PerfBuf(#[from] aya::maps::perf::PerfBufferError),
 /// # }
-/// # let bpf = aya::Bpf::load(&[])?;
+/// # let mut bpf = aya::Bpf::load(&[])?;
 /// use aya::maps::PerfEventArray;
 /// use aya::util::online_cpus;
-/// use std::convert::{TryFrom, TryInto};
 /// use bytes::BytesMut;
 ///
-/// let mut perf_array = PerfEventArray::try_from(bpf.map_mut("EVENTS")?)?;
+/// let mut perf_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").unwrap())?;
 ///
 /// // eBPF programs are going to write to the EVENTS perf array, using the id of the CPU they're
 /// // running on as the array index.
@@ -143,7 +144,7 @@ impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
 ///
 /// In the example above the implementation of `poll_buffers()` and `poll.poll_readable()` is not
 /// given. [`PerfEventArrayBuffer`] implements the [`AsRawFd`] trait, so you can implement polling
-/// using any crate that can poll file descriptors, like [epoll], [mio] etc.  
+/// using any crate that can poll file descriptors, like [epoll], [mio] etc.
 ///
 /// Perf buffers are internally implemented as ring buffers. If your eBPF programs produce large
 /// amounts of data, in order not to lose events you might want to process each
@@ -160,28 +161,21 @@ impl<T: DerefMut<Target = Map>> AsRawFd for PerfEventArrayBuffer<T> {
 /// [tokio]: https://docs.rs/tokio
 /// [async-std]: https://docs.rs/async-std
 #[doc(alias = "BPF_MAP_TYPE_PERF_EVENT_ARRAY")]
-pub struct PerfEventArray<T: DerefMut<Target = Map>> {
+pub struct PerfEventArray<T> {
     map: Arc<T>,
     page_size: usize,
 }
 
-impl<T: DerefMut<Target = Map>> PerfEventArray<T> {
-    pub(crate) fn new(map: T) -> Result<PerfEventArray<T>, MapError> {
-        let map_type = map.obj.def.map_type;
-        if map_type != BPF_MAP_TYPE_PERF_EVENT_ARRAY as u32 {
-            return Err(MapError::InvalidMapType {
-                map_type: map_type as u32,
-            });
-        }
-        let _fd = map.fd_or_err()?;
-
-        Ok(PerfEventArray {
+impl<T: Borrow<MapData>> PerfEventArray<T> {
+    pub(crate) fn new(map: T) -> Result<Self, MapError> {
+        Ok(Self {
             map: Arc::new(map),
-            // Safety: libc
-            page_size: unsafe { sysconf(_SC_PAGESIZE) } as usize,
+            page_size: page_size(),
         })
     }
+}
 
+impl<T: BorrowMut<MapData>> PerfEventArray<T> {
     /// Opens the perf buffer at the given index.
     ///
     /// The returned buffer will receive all the events eBPF programs send at the given index.
@@ -192,23 +186,15 @@ impl<T: DerefMut<Target = Map>> PerfEventArray<T> {
     ) -> Result<PerfEventArrayBuffer<T>, PerfBufferError> {
         // FIXME: keep track of open buffers
 
-        // this cannot fail as new() checks that the fd is open
-        let map_fd = self.map.fd_or_err().unwrap();
+        let map_data: &MapData = self.map.deref().borrow();
+        let map_fd = map_data.fd().as_fd();
         let buf = PerfBuffer::open(index, self.page_size, page_count.unwrap_or(2))?;
-        bpf_map_update_elem(map_fd, &index, &buf.as_raw_fd(), 0)
+        bpf_map_update_elem(map_fd, Some(&index), &buf.as_raw_fd(), 0)
             .map_err(|(_, io_error)| io_error)?;
 
         Ok(PerfEventArrayBuffer {
             buf,
             _map: self.map.clone(),
         })
-    }
-}
-
-impl TryFrom<MapRefMut> for PerfEventArray<MapRefMut> {
-    type Error = MapError;
-
-    fn try_from(a: MapRefMut) -> Result<PerfEventArray<MapRefMut>, MapError> {
-        PerfEventArray::new(a)
     }
 }

@@ -1,4 +1,6 @@
 Cargo.lock
 target/
-.vscode
-libbpf/
+.vscode/
+!.vscode/settings.json
+site/
+.idea/

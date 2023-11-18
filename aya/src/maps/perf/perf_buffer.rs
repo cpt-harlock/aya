@@ -1,13 +1,13 @@
 use std::{
     ffi::c_void,
     io, mem,
-    os::unix::io::{AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     ptr, slice,
     sync::atomic::{self, AtomicPtr, Ordering},
 };
 
 use bytes::BytesMut;
-use libc::{c_int, close, munmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{munmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use thiserror::Error;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         perf_event_header, perf_event_mmap_page,
         perf_event_type::{PERF_RECORD_LOST, PERF_RECORD_SAMPLE},
     },
-    sys::{perf_event_ioctl, perf_event_open_bpf},
+    sys::{mmap, perf_event_ioctl, perf_event_open_bpf, SysResult},
     PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE,
 };
 
@@ -24,11 +24,15 @@ use crate::{
 pub enum PerfBufferError {
     /// the page count value passed to [`PerfEventArray::open`](crate::maps::PerfEventArray::open) is invalid.
     #[error("invalid page count {page_count}, the value must be a power of two")]
-    InvalidPageCount { page_count: usize },
+    InvalidPageCount {
+        /// the page count
+        page_count: usize,
+    },
 
     /// `perf_event_open` failed.
     #[error("perf_event_open failed: {io_error}")]
     OpenError {
+        /// the source of this error
         #[source]
         io_error: io::Error,
     },
@@ -36,6 +40,7 @@ pub enum PerfBufferError {
     /// `mmap`-ping the buffer failed.
     #[error("mmap failed: {io_error}")]
     MMapError {
+        /// the source of this error
         #[source]
         io_error: io::Error,
     },
@@ -44,6 +49,7 @@ pub enum PerfBufferError {
     #[error("PERF_EVENT_IOC_ENABLE failed: {io_error}")]
     PerfEventEnableError {
         #[source]
+        /// the source of this error
         io_error: io::Error,
     },
 
@@ -53,8 +59,15 @@ pub enum PerfBufferError {
 
     /// `read_events()` was called with a buffer that is not large enough to
     /// contain the next event in the perf buffer.
+    #[deprecated(
+        since = "0.10.8",
+        note = "read_events() now calls BytesMut::reserve() internally, so this error is never returned"
+    )]
     #[error("the buffer needs to be of at least {size} bytes")]
-    MoreSpaceNeeded { size: usize },
+    MoreSpaceNeeded {
+        /// expected size
+        size: usize,
+    },
 
     /// An IO error occurred.
     #[error(transparent)]
@@ -62,7 +75,7 @@ pub enum PerfBufferError {
 }
 
 /// Return type of `read_events()`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Events {
     /// The number of events read.
     pub read: usize,
@@ -70,11 +83,12 @@ pub struct Events {
     pub lost: usize,
 }
 
+#[derive(Debug)]
 pub(crate) struct PerfBuffer {
     buf: AtomicPtr<perf_event_mmap_page>,
     size: usize,
     page_size: usize,
-    fd: RawFd,
+    fd: OwnedFd,
 }
 
 impl PerfBuffer {
@@ -82,14 +96,13 @@ impl PerfBuffer {
         cpu_id: u32,
         page_size: usize,
         page_count: usize,
-    ) -> Result<PerfBuffer, PerfBufferError> {
+    ) -> Result<Self, PerfBufferError> {
         if !page_count.is_power_of_two() {
             return Err(PerfBufferError::InvalidPageCount { page_count });
         }
 
         let fd = perf_event_open_bpf(cpu_id as i32)
-            .map_err(|(_, io_error)| PerfBufferError::OpenError { io_error })?
-            as RawFd;
+            .map_err(|(_, io_error)| PerfBufferError::OpenError { io_error })?;
         let size = page_size * page_count;
         let buf = unsafe {
             mmap(
@@ -97,7 +110,7 @@ impl PerfBuffer {
                 size + page_size,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
-                fd,
+                fd.as_fd(),
                 0,
             )
         };
@@ -107,14 +120,14 @@ impl PerfBuffer {
             });
         }
 
-        let perf_buf = PerfBuffer {
+        let perf_buf = Self {
             buf: AtomicPtr::new(buf as *mut perf_event_mmap_page),
             fd,
             size,
             page_size,
         };
 
-        perf_event_ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)
+        perf_event_ioctl(perf_buf.fd.as_fd(), PERF_EVENT_IOC_ENABLE, 0)
             .map_err(|(_, io_error)| PerfBufferError::PerfEventEnableError { io_error })?;
 
         Ok(perf_buf)
@@ -183,10 +196,7 @@ impl PerfBuffer {
             match event_type {
                 x if x == PERF_RECORD_SAMPLE as u32 => {
                     buf.clear();
-                    if sample_size > buf.capacity() {
-                        return Err(PerfBufferError::MoreSpaceNeeded { size: sample_size });
-                    }
-
+                    buf.reserve(sample_size);
                     unsafe { buf.set_len(sample_size) };
 
                     fill_buf(sample_start, base, self.size, buf);
@@ -230,12 +240,6 @@ impl PerfBuffer {
                     events.lost += lost;
                 }
                 Ok(None) => { /* skip unknown event type */ }
-                Err(PerfBufferError::MoreSpaceNeeded { .. }) if events.read > 0 => {
-                    // we have processed some events so we're going to return those. In the
-                    // next read_events() we'll return an error unless the caller increases the
-                    // buffer size
-                    break;
-                }
                 Err(e) => {
                     // we got an error and we didn't process any events, propagate the error
                     // and give the caller a chance to increase buffers
@@ -256,65 +260,54 @@ impl PerfBuffer {
 
 impl AsRawFd for PerfBuffer {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for PerfBuffer {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
 impl Drop for PerfBuffer {
     fn drop(&mut self) {
         unsafe {
-            let _ = perf_event_ioctl(self.fd, PERF_EVENT_IOC_DISABLE, 0);
+            let _: SysResult<_> = perf_event_ioctl(self.fd.as_fd(), PERF_EVENT_IOC_DISABLE, 0);
             munmap(
                 self.buf.load(Ordering::SeqCst) as *mut c_void,
                 self.size + self.page_size,
             );
-            close(self.fd);
         }
     }
-}
-
-#[cfg_attr(test, allow(unused_variables))]
-unsafe fn mmap(
-    addr: *mut c_void,
-    len: usize,
-    prot: c_int,
-    flags: c_int,
-    fd: i32,
-    offset: libc::off_t,
-) -> *mut c_void {
-    #[cfg(not(test))]
-    return libc::mmap(addr, len, prot, flags, fd, offset);
-
-    #[cfg(test)]
-    use crate::sys::TEST_MMAP_RET;
-
-    #[cfg(test)]
-    TEST_MMAP_RET.with(|ret| *ret.borrow())
 }
 
 #[derive(Debug)]
 #[repr(C)]
 struct Sample {
     header: perf_event_header,
-    pub size: u32,
+    size: u32,
 }
 
 #[repr(C)]
 #[derive(Debug)]
 struct LostSamples {
     header: perf_event_header,
-    pub id: u64,
-    pub count: u64,
+    id: u64,
+    count: u64,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fmt::Debug, mem};
+
+    use assert_matches::assert_matches;
+
     use super::*;
     use crate::{
         generated::perf_event_mmap_page,
         sys::{override_syscall, Syscall, TEST_MMAP_RET},
     };
-    use std::{convert::TryInto, fmt::Debug, mem};
 
     const PAGE_SIZE: usize = 4096;
     union MMappedBuf {
@@ -322,52 +315,49 @@ mod tests {
         data: [u8; PAGE_SIZE * 2],
     }
 
-    fn fake_mmap(buf: &mut MMappedBuf) {
+    fn fake_mmap(buf: &MMappedBuf) {
         override_syscall(|call| match call {
             Syscall::PerfEventOpen { .. } | Syscall::PerfEventIoctl { .. } => Ok(42),
-            _ => panic!(),
+            call => panic!("unexpected syscall: {:?}", call),
         });
         TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = buf as *const _ as *mut _);
     }
 
     #[test]
     fn test_invalid_page_count() {
-        assert!(matches!(
+        assert_matches!(
             PerfBuffer::open(1, PAGE_SIZE, 0),
             Err(PerfBufferError::InvalidPageCount { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             PerfBuffer::open(1, PAGE_SIZE, 3),
             Err(PerfBufferError::InvalidPageCount { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             PerfBuffer::open(1, PAGE_SIZE, 5),
             Err(PerfBufferError::InvalidPageCount { .. })
-        ));
+        );
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_no_out_bufs() {
-        let mut mmapped_buf = MMappedBuf {
+        let mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
 
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
-        assert!(matches!(
-            buf.read_events(&mut []),
-            Err(PerfBufferError::NoBuffers)
-        ))
+        assert_matches!(buf.read_events(&mut []), Err(PerfBufferError::NoBuffers))
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_no_events() {
-        let mut mmapped_buf = MMappedBuf {
+        let mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
 
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
         let out_buf = BytesMut::with_capacity(4);
@@ -383,7 +373,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
 
         let evt = LostSamples {
             header: perf_event_header {
@@ -448,7 +438,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         write_sample(&mut mmapped_buf, 0, 0xCAFEBABEu32);
@@ -466,7 +456,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         let next = write_sample(&mut mmapped_buf, 0, 0xCAFEBABEu32);
@@ -489,7 +479,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         let next = write_sample(&mut mmapped_buf, 0, 0xCAFEBABEu32);
@@ -511,7 +501,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         let offset = PAGE_SIZE - mem::size_of::<PerfSample<u32>>();
@@ -531,7 +521,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         let header = perf_event_header {
@@ -560,7 +550,7 @@ mod tests {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
         };
-        fake_mmap(&mut mmapped_buf);
+        fake_mmap(&mmapped_buf);
         let mut buf = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
 
         let sample = PerfSample {

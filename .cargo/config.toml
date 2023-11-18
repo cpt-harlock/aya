@@ -1,0 +1,11 @@
+[alias]
+xtask = "run --package xtask --"
+
+[target.armv7-unknown-linux-gnueabi]
+linker = "arm-linux-gnueabi-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"

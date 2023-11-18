@@ -1,13 +1,19 @@
-use std::{collections::HashMap, ffi::CStr, io, mem, os::unix::io::RawFd, ptr, slice};
-use thiserror::Error;
+use std::{
+    collections::HashMap,
+    ffi::CStr,
+    io, mem,
+    os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
+    ptr, slice,
+};
 
 use libc::{
-    c_int, close, getsockname, nlattr, nlmsgerr, nlmsghdr, recv, send, setsockopt, sockaddr_nl,
-    socket, AF_NETLINK, AF_UNSPEC, ETH_P_ALL, IFLA_XDP, NETLINK_ROUTE, NLA_ALIGNTO, NLA_F_NESTED,
-    NLA_TYPE_MASK, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_ECHO,
-    NLM_F_EXCL, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELTFILTER, RTM_GETTFILTER, RTM_NEWQDISC,
-    RTM_NEWTFILTER, RTM_SETLINK, SOCK_RAW, SOL_NETLINK,
+    getsockname, nlattr, nlmsgerr, nlmsghdr, recv, send, setsockopt, sockaddr_nl, socket,
+    AF_NETLINK, AF_UNSPEC, ETH_P_ALL, IFF_UP, IFLA_XDP, NETLINK_EXT_ACK, NETLINK_ROUTE,
+    NLA_ALIGNTO, NLA_F_NESTED, NLA_TYPE_MASK, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_DUMP, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELTFILTER, RTM_GETTFILTER,
+    RTM_NEWQDISC, RTM_NEWTFILTER, RTM_SETLINK, SOCK_RAW, SOL_NETLINK,
 };
+use thiserror::Error;
 
 use crate::{
     generated::{
@@ -20,14 +26,13 @@ use crate::{
 };
 
 const NLA_HDR_LEN: usize = align_to(mem::size_of::<nlattr>(), NLA_ALIGNTO as usize);
-const NETLINK_EXT_ACK: c_int = 11;
 
 // Safety: marking this as unsafe overall because of all the pointer math required to comply with
 // netlink alignments
 pub(crate) unsafe fn netlink_set_xdp_fd(
     if_index: i32,
-    fd: RawFd,
-    old_fd: Option<RawFd>,
+    fd: Option<BorrowedFd<'_>>,
+    old_fd: Option<BorrowedFd<'_>>,
     flags: u32,
 ) -> Result<(), io::Error> {
     let sock = NetlinkSocket::open()?;
@@ -49,14 +54,20 @@ pub(crate) unsafe fn netlink_set_xdp_fd(
     // write the attrs
     let attrs_buf = request_attributes(&mut req, nlmsg_len);
     let mut attrs = NestedAttrs::new(attrs_buf, IFLA_XDP);
-    attrs.write_attr(IFLA_XDP_FD as u16, fd)?;
+    attrs.write_attr(
+        IFLA_XDP_FD as u16,
+        fd.map(|fd| fd.as_raw_fd()).unwrap_or(-1),
+    )?;
 
     if flags > 0 {
         attrs.write_attr(IFLA_XDP_FLAGS as u16, flags)?;
     }
 
     if flags & XDP_FLAGS_REPLACE != 0 {
-        attrs.write_attr(IFLA_XDP_EXPECTED_FD as u16, old_fd.unwrap())?;
+        attrs.write_attr(
+            IFLA_XDP_EXPECTED_FD as u16,
+            old_fd.map(|fd| fd.as_raw_fd()).unwrap(),
+        )?;
     }
 
     let nla_len = attrs.finish()?;
@@ -91,7 +102,7 @@ pub(crate) unsafe fn netlink_qdisc_add_clsact(if_index: i32) -> Result<(), io::E
     // add the TCA_KIND attribute
     let attrs_buf = request_attributes(&mut req, nlmsg_len);
     let attr_len = write_attr_bytes(attrs_buf, 0, TCA_KIND as u16, b"clsact\0")?;
-    req.header.nlmsg_len += align_to(attr_len as usize, NLA_ALIGNTO as usize) as u32;
+    req.header.nlmsg_len += align_to(attr_len, NLA_ALIGNTO as usize) as u32;
 
     sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
     sock.recv()?;
@@ -102,11 +113,12 @@ pub(crate) unsafe fn netlink_qdisc_add_clsact(if_index: i32) -> Result<(), io::E
 pub(crate) unsafe fn netlink_qdisc_attach(
     if_index: i32,
     attach_type: &TcAttachType,
-    prog_fd: RawFd,
+    prog_fd: BorrowedFd<'_>,
     prog_name: &CStr,
-) -> Result<u32, io::Error> {
+    priority: u16,
+    handle: u32,
+) -> Result<(u16, u32), io::Error> {
     let sock = NetlinkSocket::open()?;
-    let priority = 0;
     let mut req = mem::zeroed::<TcRequest>();
 
     let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<tcmsg>();
@@ -118,10 +130,10 @@ pub(crate) unsafe fn netlink_qdisc_attach(
         nlmsg_seq: 1,
     };
     req.tc_info.tcm_family = AF_UNSPEC as u8;
-    req.tc_info.tcm_handle = 0; // auto-assigned, if not provided
+    req.tc_info.tcm_handle = handle; // auto-assigned, if zero
     req.tc_info.tcm_ifindex = if_index;
     req.tc_info.tcm_parent = attach_type.parent();
-    req.tc_info.tcm_info = tc_handler_make(priority << 16, htons(ETH_P_ALL as u16) as u32);
+    req.tc_info.tcm_info = tc_handler_make((priority as u32) << 16, htons(ETH_P_ALL as u16) as u32);
 
     let attrs_buf = request_attributes(&mut req, nlmsg_len);
 
@@ -136,20 +148,17 @@ pub(crate) unsafe fn netlink_qdisc_attach(
     options.write_attr(TCA_BPF_FLAGS as u16, flags)?;
     let options_len = options.finish()?;
 
-    req.header.nlmsg_len += align_to(kind_len + options_len as usize, NLA_ALIGNTO as usize) as u32;
+    req.header.nlmsg_len += align_to(kind_len + options_len, NLA_ALIGNTO as usize) as u32;
     sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
 
-    // find the RTM_NEWTFILTER reply and read the tcm_info field which we'll
-    // need to detach
-    let tc_info = match sock
+    // find the RTM_NEWTFILTER reply and read the tcm_info and tcm_handle fields
+    // which we'll need to detach
+    let tc_msg = match sock
         .recv()?
         .iter()
         .find(|reply| reply.header.nlmsg_type == RTM_NEWTFILTER)
     {
-        Some(reply) => {
-            let msg = ptr::read_unaligned(reply.data.as_ptr() as *const tcmsg);
-            msg.tcm_info
-        }
+        Some(reply) => ptr::read_unaligned(reply.data.as_ptr() as *const tcmsg),
         None => {
             // if sock.recv() succeeds we should never get here unless there's a
             // bug in the kernel
@@ -160,14 +169,15 @@ pub(crate) unsafe fn netlink_qdisc_attach(
         }
     };
 
-    let priority = ((tc_info & TC_H_MAJ_MASK) >> 16) as u32;
-    Ok(priority)
+    let priority = ((tc_msg.tcm_info & TC_H_MAJ_MASK) >> 16) as u16;
+    Ok((priority, tc_msg.tcm_handle))
 }
 
 pub(crate) unsafe fn netlink_qdisc_detach(
     if_index: i32,
     attach_type: &TcAttachType,
-    priority: u32,
+    priority: u16,
+    handle: u32,
 ) -> Result<(), io::Error> {
     let sock = NetlinkSocket::open()?;
     let mut req = mem::zeroed::<TcRequest>();
@@ -181,8 +191,8 @@ pub(crate) unsafe fn netlink_qdisc_detach(
     };
 
     req.tc_info.tcm_family = AF_UNSPEC as u8;
-    req.tc_info.tcm_handle = 0; // auto-assigned, if not provided
-    req.tc_info.tcm_info = tc_handler_make(priority << 16, htons(ETH_P_ALL as u16) as u32);
+    req.tc_info.tcm_handle = handle; // auto-assigned, if zero
+    req.tc_info.tcm_info = tc_handler_make((priority as u32) << 16, htons(ETH_P_ALL as u16) as u32);
     req.tc_info.tcm_parent = attach_type.parent();
     req.tc_info.tcm_ifindex = if_index;
 
@@ -193,11 +203,12 @@ pub(crate) unsafe fn netlink_qdisc_detach(
     Ok(())
 }
 
+// Returns a vector of tuple (priority, handle) for filters matching the provided parameters
 pub(crate) unsafe fn netlink_find_filter_with_name(
     if_index: i32,
     attach_type: TcAttachType,
     name: &CStr,
-) -> Result<Vec<u32>, io::Error> {
+) -> Result<Vec<(u16, u32)>, io::Error> {
     let mut req = mem::zeroed::<TcRequest>();
 
     let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<tcmsg>();
@@ -209,21 +220,21 @@ pub(crate) unsafe fn netlink_find_filter_with_name(
         nlmsg_seq: 1,
     };
     req.tc_info.tcm_family = AF_UNSPEC as u8;
-    req.tc_info.tcm_handle = 0; // auto-assigned, if not provided
+    req.tc_info.tcm_handle = 0; // auto-assigned, if zero
     req.tc_info.tcm_ifindex = if_index;
     req.tc_info.tcm_parent = attach_type.parent();
 
     let sock = NetlinkSocket::open()?;
     sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
 
-    let mut prios = Vec::new();
+    let mut filter_info = Vec::new();
     for msg in sock.recv()? {
         if msg.header.nlmsg_type != RTM_NEWTFILTER {
             continue;
         }
 
         let tc_msg = ptr::read_unaligned(msg.data.as_ptr() as *const tcmsg);
-        let priority = tc_msg.tcm_info >> 16;
+        let priority = (tc_msg.tcm_info >> 16) as u16;
         let attrs = parse_attrs(&msg.data[mem::size_of::<tcmsg>()..])?;
 
         if let Some(opts) = attrs.get(&(TCA_OPTIONS as u16)) {
@@ -231,14 +242,40 @@ pub(crate) unsafe fn netlink_find_filter_with_name(
             if let Some(f_name) = opts.get(&(TCA_BPF_NAME as u16)) {
                 if let Ok(f_name) = CStr::from_bytes_with_nul(f_name.data) {
                     if name == f_name {
-                        prios.push(priority);
+                        filter_info.push((priority, tc_msg.tcm_handle));
                     }
                 }
             }
         }
     }
 
-    Ok(prios)
+    Ok(filter_info)
+}
+
+#[doc(hidden)]
+pub unsafe fn netlink_set_link_up(if_index: i32) -> Result<(), io::Error> {
+    let sock = NetlinkSocket::open()?;
+
+    // Safety: Request is POD so this is safe
+    let mut req = mem::zeroed::<Request>();
+
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_ACK) as u16,
+        nlmsg_type: RTM_SETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.if_info.ifi_family = AF_UNSPEC as u8;
+    req.if_info.ifi_index = if_index;
+    req.if_info.ifi_flags = IFF_UP as u32;
+    req.if_info.ifi_change = IFF_UP as u32;
+
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    sock.recv()?;
+
+    Ok(())
 }
 
 #[repr(C)]
@@ -256,23 +293,25 @@ struct TcRequest {
 }
 
 struct NetlinkSocket {
-    sock: RawFd,
+    sock: OwnedFd,
     _nl_pid: u32,
 }
 
 impl NetlinkSocket {
-    fn open() -> Result<NetlinkSocket, io::Error> {
+    fn open() -> Result<Self, io::Error> {
         // Safety: libc wrapper
         let sock = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
         if sock < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `socket` returns a file descriptor.
+        let sock = unsafe { OwnedFd::from_raw_fd(sock) };
 
         let enable = 1i32;
         // Safety: libc wrapper
         unsafe {
             setsockopt(
-                sock,
+                sock.as_raw_fd(),
                 SOL_NETLINK,
                 NETLINK_EXT_ACK,
                 &enable as *const _ as *const _,
@@ -285,19 +324,33 @@ impl NetlinkSocket {
         addr.nl_family = AF_NETLINK as u16;
         let mut addr_len = mem::size_of::<sockaddr_nl>() as u32;
         // Safety: libc wrapper
-        if unsafe { getsockname(sock, &mut addr as *mut _ as *mut _, &mut addr_len as *mut _) } < 0
+        if unsafe {
+            getsockname(
+                sock.as_raw_fd(),
+                &mut addr as *mut _ as *mut _,
+                &mut addr_len as *mut _,
+            )
+        } < 0
         {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(NetlinkSocket {
+        Ok(Self {
             sock,
             _nl_pid: addr.nl_pid,
         })
     }
 
     fn send(&self, msg: &[u8]) -> Result<(), io::Error> {
-        if unsafe { send(self.sock, msg.as_ptr() as *const _, msg.len(), 0) } < 0 {
+        if unsafe {
+            send(
+                self.sock.as_raw_fd(),
+                msg.as_ptr() as *const _,
+                msg.len(),
+                0,
+            )
+        } < 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -310,7 +363,14 @@ impl NetlinkSocket {
         'out: while multipart {
             multipart = false;
             // Safety: libc wrapper
-            let len = unsafe { recv(self.sock, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+            let len = unsafe {
+                recv(
+                    self.sock.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    0,
+                )
+            };
             if len < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -350,7 +410,7 @@ struct NetlinkMessage {
 }
 
 impl NetlinkMessage {
-    fn read(buf: &[u8]) -> Result<NetlinkMessage, io::Error> {
+    fn read(buf: &[u8]) -> Result<Self, io::Error> {
         if mem::size_of::<nlmsghdr>() > buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -388,18 +448,11 @@ impl NetlinkMessage {
             (buf[data_offset..msg_len].to_vec(), None)
         };
 
-        Ok(NetlinkMessage {
+        Ok(Self {
             header,
             data,
             error,
         })
-    }
-}
-
-impl Drop for NetlinkSocket {
-    fn drop(&mut self) {
-        // Safety: libc wrapper
-        unsafe { close(self.sock) };
     }
 }
 
@@ -418,8 +471,8 @@ struct NestedAttrs<'a> {
 }
 
 impl<'a> NestedAttrs<'a> {
-    fn new(buf: &mut [u8], top_attr_type: u16) -> NestedAttrs<'_> {
-        NestedAttrs {
+    fn new(buf: &'a mut [u8], top_attr_type: u16) -> Self {
+        Self {
             buf,
             top_attr_type,
             offset: NLA_HDR_LEN,
@@ -441,7 +494,7 @@ impl<'a> NestedAttrs<'a> {
     fn finish(self) -> Result<usize, io::Error> {
         let nla_len = self.offset;
         let attr = nlattr {
-            nla_type: NLA_F_NESTED as u16 | self.top_attr_type as u16,
+            nla_type: NLA_F_NESTED as u16 | self.top_attr_type,
             nla_len: nla_len as u16,
         };
 
@@ -468,7 +521,7 @@ fn write_attr_bytes(
     value: &[u8],
 ) -> Result<usize, io::Error> {
     let attr = nlattr {
-        nla_type: attr_type as u16,
+        nla_type: attr_type,
         nla_len: ((NLA_HDR_LEN + value.len()) as u16),
     };
 
@@ -503,8 +556,8 @@ struct NlAttrsIterator<'a> {
 }
 
 impl<'a> NlAttrsIterator<'a> {
-    fn new(attrs: &[u8]) -> NlAttrsIterator {
-        NlAttrsIterator { attrs, offset: 0 }
+    fn new(attrs: &'a [u8]) -> Self {
+        Self { attrs, offset: 0 }
     }
 }
 
@@ -545,7 +598,7 @@ impl<'a> Iterator for NlAttrsIterator<'a> {
     }
 }
 
-fn parse_attrs(buf: &[u8]) -> Result<HashMap<u16, NlAttr>, NlAttrError> {
+fn parse_attrs(buf: &[u8]) -> Result<HashMap<u16, NlAttr<'_>>, NlAttrError> {
     let mut attrs = HashMap::new();
     for attr in NlAttrsIterator::new(buf) {
         let attr = attr?;
@@ -560,7 +613,7 @@ struct NlAttr<'a> {
     data: &'a [u8],
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 enum NlAttrError {
     #[error("invalid buffer size `{size}`, expected `{expected}`")]
     InvalidBufferLength { size: usize, expected: usize },
@@ -570,17 +623,14 @@ enum NlAttrError {
 }
 
 impl From<NlAttrError> for io::Error {
-    fn from(e: NlAttrError) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, e)
+    fn from(e: NlAttrError) -> Self {
+        Self::new(io::ErrorKind::Other, e)
     }
 }
 
 unsafe fn request_attributes<T>(req: &mut T, msg_len: usize) -> &mut [u8] {
-    let attrs_addr = align_to(
-        req as *const _ as usize + msg_len as usize,
-        NLMSG_ALIGNTO as usize,
-    );
-    let attrs_end = req as *const _ as usize + mem::size_of::<T>();
+    let attrs_addr = align_to(req as *mut _ as usize + msg_len, NLMSG_ALIGNTO as usize);
+    let attrs_end = req as *mut _ as usize + mem::size_of::<T>();
     slice::from_raw_parts_mut(attrs_addr as *mut u8, attrs_end - attrs_addr)
 }
 
@@ -591,7 +641,7 @@ fn bytes_of<T>(val: &T) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::TryInto, ffi::CString};
+    use std::ffi::CString;
 
     use super::*;
 
@@ -720,6 +770,6 @@ mod tests {
             TCA_BPF_NAME as u16
         );
         let name = CStr::from_bytes_with_nul(inner.data).unwrap();
-        assert_eq!(name.to_string_lossy(), "foo");
+        assert_eq!(name.to_str().unwrap(), "foo");
     }
 }

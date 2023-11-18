@@ -1,17 +1,26 @@
+//! Skskb programs.
+
+use std::{os::fd::AsFd as _, path::Path};
+
 use crate::{
     generated::{
         bpf_attach_type::{BPF_SK_SKB_STREAM_PARSER, BPF_SK_SKB_STREAM_VERDICT},
         bpf_prog_type::BPF_PROG_TYPE_SK_SKB,
     },
-    maps::sock::SocketMap,
-    programs::{load_program, LinkRef, ProgAttachLink, ProgramData, ProgramError},
-    sys::bpf_prog_attach,
+    maps::sock::SockMapFd,
+    programs::{
+        define_link_wrapper, load_program, ProgAttachLink, ProgAttachLinkId, ProgramData,
+        ProgramError,
+    },
+    VerifierLogLevel,
 };
 
 /// The kind of [`SkSkb`] program.
 #[derive(Copy, Clone, Debug)]
 pub enum SkSkbKind {
+    /// A Stream Parser
     StreamParser,
+    /// A Stream Verdict
     StreamVerdict,
 }
 
@@ -28,16 +37,29 @@ pub enum SkSkbKind {
 /// # Examples
 ///
 /// ```no_run
+/// # #[derive(Debug, thiserror::Error)]
+/// # enum Error {
+/// #     #[error(transparent)]
+/// #     IO(#[from] std::io::Error),
+/// #     #[error(transparent)]
+/// #     Map(#[from] aya::maps::MapError),
+/// #     #[error(transparent)]
+/// #     Program(#[from] aya::programs::ProgramError),
+/// #     #[error(transparent)]
+/// #     Bpf(#[from] aya::BpfError)
+/// # }
 /// # let mut bpf = aya::Bpf::load(&[])?;
-/// use std::convert::{TryFrom, TryInto};
 /// use aya::maps::SockMap;
 /// use aya::programs::SkSkb;
 ///
-/// let intercept_ingress = SockMap::try_from(bpf.map_mut("INTERCEPT_INGRESS")?)?;
-/// let prog: &mut SkSkb = bpf.program_mut("intercept_ingress_packet")?.try_into()?;
+/// let intercept_ingress: SockMap<_> = bpf.map("INTERCEPT_INGRESS").unwrap().try_into()?;
+/// let map_fd = intercept_ingress.fd().try_clone()?;
+///
+/// let prog: &mut SkSkb = bpf.program_mut("intercept_ingress_packet").unwrap().try_into()?;
 /// prog.load()?;
-/// prog.attach(&intercept_ingress)?;
-/// # Ok::<(), aya::BpfError>(())
+/// prog.attach(&map_fd)?;
+///
+/// # Ok::<(), Error>(())
 /// ```
 ///
 /// [socket maps]: crate::maps::sock
@@ -46,40 +68,65 @@ pub enum SkSkbKind {
 #[derive(Debug)]
 #[doc(alias = "BPF_PROG_TYPE_SK_SKB")]
 pub struct SkSkb {
-    pub(crate) data: ProgramData,
+    pub(crate) data: ProgramData<SkSkbLink>,
     pub(crate) kind: SkSkbKind,
 }
 
 impl SkSkb {
     /// Loads the program inside the kernel.
-    ///
-    /// See also [`Program::load`](crate::programs::Program::load).
     pub fn load(&mut self) -> Result<(), ProgramError> {
         load_program(BPF_PROG_TYPE_SK_SKB, &mut self.data)
     }
 
-    /// Returns the name of the program.
-    pub fn name(&self) -> String {
-        self.data.name.to_string()
-    }
-
     /// Attaches the program to the given socket map.
-    pub fn attach(&mut self, map: &dyn SocketMap) -> Result<LinkRef, ProgramError> {
-        let prog_fd = self.data.fd_or_err()?;
-        let map_fd = map.fd_or_err()?;
+    ///
+    /// The returned value can be used to detach, see [SkSkb::detach].
+    pub fn attach(&mut self, map: &SockMapFd) -> Result<SkSkbLinkId, ProgramError> {
+        let prog_fd = self.fd()?;
+        let prog_fd = prog_fd.as_fd();
 
         let attach_type = match self.kind {
             SkSkbKind::StreamParser => BPF_SK_SKB_STREAM_PARSER,
             SkSkbKind::StreamVerdict => BPF_SK_SKB_STREAM_VERDICT,
         };
-        bpf_prog_attach(prog_fd, map_fd, attach_type).map_err(|(_, io_error)| {
-            ProgramError::SyscallError {
-                call: "bpf_prog_attach".to_owned(),
-                io_error,
-            }
-        })?;
-        Ok(self
-            .data
-            .link(ProgAttachLink::new(prog_fd, map_fd, attach_type)))
+
+        let link = ProgAttachLink::attach(prog_fd, map.as_fd(), attach_type)?;
+
+        self.data.links.insert(SkSkbLink::new(link))
+    }
+
+    /// Detaches the program.
+    ///
+    /// See [SkSkb::attach].
+    pub fn detach(&mut self, link_id: SkSkbLinkId) -> Result<(), ProgramError> {
+        self.data.links.remove(link_id)
+    }
+
+    /// Takes ownership of the link referenced by the provided link_id.
+    ///
+    /// The link will be detached on `Drop` and the caller is now responsible
+    /// for managing its lifetime.
+    pub fn take_link(&mut self, link_id: SkSkbLinkId) -> Result<SkSkbLink, ProgramError> {
+        self.data.take_link(link_id)
+    }
+
+    /// Creates a program from a pinned entry on a bpffs.
+    ///
+    /// Existing links will not be populated. To work with existing links you should use [`crate::programs::links::PinnedLink`].
+    ///
+    /// On drop, any managed links are detached and the program is unloaded. This will not result in
+    /// the program being unloaded from the kernel if it is still pinned.
+    pub fn from_pin<P: AsRef<Path>>(path: P, kind: SkSkbKind) -> Result<Self, ProgramError> {
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
+        Ok(Self { data, kind })
     }
 }
+
+define_link_wrapper!(
+    /// The link used by [SkSkb] programs.
+    SkSkbLink,
+    /// The type returned by [SkSkb::attach]. Can be passed to [SkSkb::detach].
+    SkSkbLinkId,
+    ProgAttachLink,
+    ProgAttachLinkId
+);

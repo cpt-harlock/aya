@@ -7,22 +7,33 @@ jobs:
     runs-on: ubuntu-20.04
 
     steps:
-      - uses: actions/checkout@v2
-
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
-          repository: libbpf/libbpf
-          path: libbpf
+          submodules: recursive
 
-      - name: libbpf-version
-        working-directory: libbpf
-        run: echo "LIBBPF_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+      - name: update libbpf
+        working-directory: xtask/libbpf
+        run: |
+          set -e
+          git fetch origin
+          git checkout origin/HEAD
+          echo "LIBBPF_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-      - uses: Swatinem/rust-cache@v1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install headers
+        run: |
+          sudo apt -y update
+          sudo apt -y install libc6-dev libc6-dev-{arm64,armel,riscv64}-cross
 
       - name: Run codegen
         run: |
-          cargo xtask codegen --libbpf-dir ./libbpf
+          cargo xtask codegen
 
       - name: Check for changes
         run: |
@@ -33,17 +44,17 @@ jobs:
         if: env.COMMIT_CHANGES == 1
         uses: devops-infra/action-commit-push@master
         with:
-          github_token: "${{ secrets.GITHUB_TOKEN }}"
+          github_token: "${{ secrets.CRABBY_GITHUB_TOKEN }}"
           commit_prefix: "[codegen] Update libbpf to ${{ env.LIBBPF_SHA }}"
-          commit_message: "Created using GitHub Actions"
+          commit_message: "Update libbpf to ${{ env.LIBBPF_SHA }}"
           target_branch: codegen
-
+          force: true
 
       - name: Create pull request
         if: steps.commit.outputs.files_changed != ''
         uses: devops-infra/action-pull-request@master
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.CRABBY_GITHUB_TOKEN }}
           body: "**Automated pull request**<br><br>Update libbpf to ${{ env.LIBBPF_SHA }}"
           title: Update libbpf to ${{ env.LIBBPF_SHA }}
           source_branch: codegen

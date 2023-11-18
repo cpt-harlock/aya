@@ -1,3 +1,5 @@
+//! [![](https://aya-rs.dev/assets/images/aya_logo_docs.svg)](https://aya-rs.dev)
+//!
 //! A library to work with eBPF programs.
 //!
 //! eBPF is a technology that allows running user-supplied programs inside the
@@ -29,22 +31,66 @@
 //!
 //! [tokio]: https://docs.rs/tokio
 //! [async-std]: https://docs.rs/async-std
-#![deny(clippy::all)]
-#![allow(clippy::missing_safety_doc, clippy::len_without_is_empty)]
 
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate bitflags;
+#![doc(
+    html_logo_url = "https://aya-rs.dev/assets/images/crabby.svg",
+    html_favicon_url = "https://aya-rs.dev/assets/images/crabby.svg"
+)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(
+    clippy::all,
+    clippy::use_self,
+    absolute_paths_not_starting_with_crate,
+    deprecated_in_future,
+    elided_lifetimes_in_paths,
+    explicit_outlives_requirements,
+    ffi_unwind_calls,
+    keyword_idents,
+    //let_underscore_drop,
+    macro_use_extern_crate,
+    meta_variable_misuse,
+    missing_abi,
+    //missing_copy_implementations,
+    missing_docs,
+    non_ascii_idents,
+    noop_method_call,
+    pointer_structural_match,
+    rust_2021_incompatible_closure_captures,
+    rust_2021_incompatible_or_patterns,
+    rust_2021_prefixes_incompatible_syntax,
+    rust_2021_prelude_collisions,
+    single_use_lifetimes,
+    trivial_numeric_casts,
+    unreachable_pub,
+    //unsafe_op_in_unsafe_fn,
+    unstable_features,
+    unused_crate_dependencies,
+    unused_extern_crates,
+    unused_import_braces,
+    unused_lifetimes,
+    unused_macro_rules,
+    unused_qualifications,
+    //unused_results,
+    unused_tuple_struct_fields,
+)]
+#![allow(clippy::missing_safety_doc, clippy::len_without_is_empty)]
+#![cfg_attr(
+    all(feature = "async_tokio", feature = "async_std"),
+    allow(unused_crate_dependencies)
+)]
 
 mod bpf;
-mod generated;
+use aya_obj::generated;
 pub mod maps;
-mod obj;
+use aya_obj as obj;
+pub mod pin;
 pub mod programs;
+pub use programs::loaded_programs;
 mod sys;
 pub mod util;
 
 pub use bpf::*;
 pub use obj::btf::{Btf, BtfError};
 pub use object::Endianness;
+#[doc(hidden)]
+pub use sys::netlink_set_link_up;

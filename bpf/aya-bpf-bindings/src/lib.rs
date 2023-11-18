@@ -10,17 +10,20 @@ mod armv7;
 #[cfg(bpf_target_arch = "aarch64")]
 mod aarch64;
 
+#[cfg(bpf_target_arch = "riscv64")]
+mod riscv64;
+
 mod gen {
-    #[cfg(bpf_target_arch = "x86_64")]
-    pub use super::x86_64::*;
-
-    #[cfg(bpf_target_arch = "arm")]
-    pub use super::armv7::*;
-
     #[cfg(bpf_target_arch = "aarch64")]
     pub use super::aarch64::*;
+    #[cfg(bpf_target_arch = "arm")]
+    pub use super::armv7::*;
+    #[cfg(bpf_target_arch = "riscv64")]
+    pub use super::riscv64::*;
+    #[cfg(bpf_target_arch = "x86_64")]
+    pub use super::x86_64::*;
 }
-pub use gen::{getters, helpers};
+pub use gen::helpers;
 
 pub mod bindings {
     pub use crate::gen::bindings::*;
@@ -48,22 +51,4 @@ pub mod bindings {
         pub id: ::aya_bpf_cty::c_uint,
         pub pinning: ::aya_bpf_cty::c_uint,
     }
-}
-
-use aya_bpf_cty::{c_long, c_void};
-use core::mem::{self, MaybeUninit};
-
-#[inline]
-unsafe fn bpf_probe_read<T>(src: *const T) -> Result<T, c_long> {
-    let mut v: MaybeUninit<T> = MaybeUninit::uninit();
-    let ret = helpers::bpf_probe_read(
-        v.as_mut_ptr() as *mut c_void,
-        mem::size_of::<T>() as u32,
-        src as *const c_void,
-    );
-    if ret < 0 {
-        return Err(ret);
-    }
-
-    Ok(v.assume_init())
 }

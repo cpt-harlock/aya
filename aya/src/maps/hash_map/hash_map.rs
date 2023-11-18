@@ -1,13 +1,12 @@
 use std::{
-    convert::TryFrom,
+    borrow::{Borrow, BorrowMut},
     marker::PhantomData,
-    ops::{Deref, DerefMut},
+    os::fd::AsFd as _,
 };
 
 use crate::{
-    generated::bpf_map_type::{BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH},
-    maps::{hash_map, IterableMap, Map, MapError, MapIter, MapKeys, MapRef, MapRefMut},
-    sys::bpf_map_lookup_elem,
+    maps::{check_kv_size, hash_map, IterableMap, MapData, MapError, MapIter, MapKeys},
+    sys::{bpf_map_lookup_elem, SyscallError},
     Pod,
 };
 
@@ -20,11 +19,10 @@ use crate::{
 /// # Examples
 ///
 /// ```no_run
-/// # let bpf = aya::Bpf::load(&[])?;
+/// # let mut bpf = aya::Bpf::load(&[])?;
 /// use aya::maps::HashMap;
-/// use std::convert::TryFrom;
 ///
-/// let mut redirect_ports = HashMap::try_from(bpf.map_mut("REDIRECT_PORTS")?)?;
+/// let mut redirect_ports = HashMap::try_from(bpf.map_mut("REDIRECT_PORTS").unwrap())?;
 ///
 /// // redirect port 80 to 8080
 /// redirect_ports.insert(80, 8080, 0);
@@ -34,26 +32,19 @@ use crate::{
 /// ```
 #[doc(alias = "BPF_MAP_TYPE_HASH")]
 #[doc(alias = "BPF_MAP_TYPE_LRU_HASH")]
-pub struct HashMap<T: Deref<Target = Map>, K, V> {
-    inner: T,
+#[derive(Debug)]
+pub struct HashMap<T, K, V> {
+    pub(crate) inner: T,
     _k: PhantomData<K>,
     _v: PhantomData<V>,
 }
 
-impl<T: Deref<Target = Map>, K: Pod, V: Pod> HashMap<T, K, V> {
-    pub(crate) fn new(map: T) -> Result<HashMap<T, K, V>, MapError> {
-        let map_type = map.obj.def.map_type;
+impl<T: Borrow<MapData>, K: Pod, V: Pod> HashMap<T, K, V> {
+    pub(crate) fn new(map: T) -> Result<Self, MapError> {
+        let data = map.borrow();
+        check_kv_size::<K, V>(data)?;
 
-        // validate the map definition
-        if map_type != BPF_MAP_TYPE_HASH as u32 && map_type != BPF_MAP_TYPE_LRU_HASH as u32 {
-            return Err(MapError::InvalidMapType {
-                map_type: map_type as u32,
-            });
-        }
-        hash_map::check_kv_size::<K, V>(&map)?;
-        let _ = map.fd_or_err()?;
-
-        Ok(HashMap {
+        Ok(Self {
             inner: map,
             _k: PhantomData,
             _v: PhantomData,
@@ -61,255 +52,171 @@ impl<T: Deref<Target = Map>, K: Pod, V: Pod> HashMap<T, K, V> {
     }
 
     /// Returns a copy of the value associated with the key.
-    pub unsafe fn get(&self, key: &K, flags: u64) -> Result<V, MapError> {
-        let fd = self.inner.deref().fd_or_err()?;
-        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(code, io_error)| {
-            MapError::SyscallError {
-                call: "bpf_map_lookup_elem".to_owned(),
-                code,
-                io_error,
-            }
+    pub fn get(&self, key: &K, flags: u64) -> Result<V, MapError> {
+        let fd = self.inner.borrow().fd().as_fd();
+        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
+            call: "bpf_map_lookup_elem",
+            io_error,
         })?;
         value.ok_or(MapError::KeyNotFound)
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order. The
     /// iterator item type is `Result<(K, V), MapError>`.
-    pub unsafe fn iter(&self) -> MapIter<'_, K, V> {
+    pub fn iter(&self) -> MapIter<'_, K, V, Self> {
         MapIter::new(self)
     }
 
     /// An iterator visiting all keys in arbitrary order. The iterator element
     /// type is `Result<K, MapError>`.
-    pub unsafe fn keys(&self) -> MapKeys<'_, K> {
-        MapKeys::new(&self.inner)
+    pub fn keys(&self) -> MapKeys<'_, K> {
+        MapKeys::new(self.inner.borrow())
     }
 }
 
-impl<T: DerefMut<Target = Map>, K: Pod, V: Pod> HashMap<T, K, V> {
+impl<T: BorrowMut<MapData>, K: Pod, V: Pod> HashMap<T, K, V> {
     /// Inserts a key-value pair into the map.
-    pub fn insert(&mut self, key: K, value: V, flags: u64) -> Result<(), MapError> {
-        hash_map::insert(&mut self.inner, key, value, flags)
+    pub fn insert(
+        &mut self,
+        key: impl Borrow<K>,
+        value: impl Borrow<V>,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        hash_map::insert(self.inner.borrow_mut(), key.borrow(), value.borrow(), flags)
     }
 
     /// Removes a key from the map.
     pub fn remove(&mut self, key: &K) -> Result<(), MapError> {
-        hash_map::remove(&mut self.inner, key)
+        hash_map::remove(self.inner.borrow_mut(), key)
     }
 }
 
-impl<T: Deref<Target = Map>, K: Pod, V: Pod> IterableMap<K, V> for HashMap<T, K, V> {
-    fn map(&self) -> &Map {
-        &self.inner
+impl<T: Borrow<MapData>, K: Pod, V: Pod> IterableMap<K, V> for HashMap<T, K, V> {
+    fn map(&self) -> &MapData {
+        self.inner.borrow()
     }
 
-    unsafe fn get(&self, key: &K) -> Result<V, MapError> {
-        HashMap::get(self, key, 0)
-    }
-}
-
-impl<K: Pod, V: Pod> TryFrom<MapRef> for HashMap<MapRef, K, V> {
-    type Error = MapError;
-
-    fn try_from(a: MapRef) -> Result<HashMap<MapRef, K, V>, MapError> {
-        HashMap::new(a)
-    }
-}
-
-impl<K: Pod, V: Pod> TryFrom<MapRefMut> for HashMap<MapRefMut, K, V> {
-    type Error = MapError;
-
-    fn try_from(a: MapRefMut) -> Result<HashMap<MapRefMut, K, V>, MapError> {
-        HashMap::new(a)
-    }
-}
-
-impl<'a, K: Pod, V: Pod> TryFrom<&'a Map> for HashMap<&'a Map, K, V> {
-    type Error = MapError;
-
-    fn try_from(a: &'a Map) -> Result<HashMap<&'a Map, K, V>, MapError> {
-        HashMap::new(a)
-    }
-}
-
-impl<'a, K: Pod, V: Pod> TryFrom<&'a mut Map> for HashMap<&'a mut Map, K, V> {
-    type Error = MapError;
-
-    fn try_from(a: &'a mut Map) -> Result<HashMap<&'a mut Map, K, V>, MapError> {
-        HashMap::new(a)
+    fn get(&self, key: &K) -> Result<V, MapError> {
+        Self::get(self, key, 0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{ffi::c_long, io};
 
+    use assert_matches::assert_matches;
     use libc::{EFAULT, ENOENT};
 
+    use super::{
+        super::test_utils::{self, new_map},
+        *,
+    };
     use crate::{
-        bpf_map_def,
         generated::{
             bpf_attr, bpf_cmd,
-            bpf_map_type::{BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERF_EVENT_ARRAY},
+            bpf_map_type::{BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH},
         },
+        maps::Map,
         obj,
         sys::{override_syscall, SysResult, Syscall},
     };
 
-    use super::*;
-
-    fn new_obj_map(name: &str) -> obj::Map {
-        obj::Map {
-            name: name.to_string(),
-            def: bpf_map_def {
-                map_type: BPF_MAP_TYPE_HASH as u32,
-                key_size: 4,
-                value_size: 4,
-                max_entries: 1024,
-                ..Default::default()
-            },
-            section_index: 0,
-            data: Vec::new(),
-        }
+    fn new_obj_map() -> obj::Map {
+        test_utils::new_obj_map(BPF_MAP_TYPE_HASH)
     }
 
-    fn sys_error(value: i32) -> SysResult {
+    fn sys_error(value: i32) -> SysResult<c_long> {
         Err((-1, io::Error::from_raw_os_error(value)))
     }
 
     #[test]
     fn test_wrong_key_size() {
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: None,
-            pinned: false,
-        };
-        assert!(matches!(
+        let map = new_map(new_obj_map());
+        assert_matches!(
             HashMap::<_, u8, u32>::new(&map),
             Err(MapError::InvalidKeySize {
                 size: 1,
                 expected: 4
             })
-        ));
+        );
     }
 
     #[test]
     fn test_wrong_value_size() {
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: None,
-            pinned: false,
-        };
-        assert!(matches!(
+        let map = new_map(new_obj_map());
+        assert_matches!(
             HashMap::<_, u32, u16>::new(&map),
             Err(MapError::InvalidValueSize {
                 size: 2,
                 expected: 4
             })
-        ));
+        );
     }
 
     #[test]
     fn test_try_from_wrong_map() {
-        let map = Map {
-            obj: obj::Map {
-                name: "TEST".to_string(),
-                def: bpf_map_def {
-                    map_type: BPF_MAP_TYPE_PERF_EVENT_ARRAY as u32,
-                    key_size: 4,
-                    value_size: 4,
-                    max_entries: 1024,
-                    ..Default::default()
-                },
-                section_index: 0,
-                data: Vec::new(),
-            },
-            fd: None,
-            pinned: false,
-        };
-
-        assert!(matches!(
-            HashMap::<_, u32, u32>::try_from(&map),
+        let map = new_map(new_obj_map());
+        let map = Map::Array(map);
+        assert_matches!(
+            HashMap::<_, u8, u32>::try_from(&map),
             Err(MapError::InvalidMapType { .. })
-        ));
+        );
     }
 
     #[test]
-    fn test_new_not_created() {
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: None,
-            pinned: false,
-        };
-
-        assert!(matches!(
-            HashMap::<_, u32, u32>::new(&mut map),
-            Err(MapError::NotCreated { .. })
-        ));
+    fn test_try_from_wrong_map_values() {
+        let map = new_map(new_obj_map());
+        let map = Map::HashMap(map);
+        assert_matches!(
+            HashMap::<_, u32, u16>::try_from(&map),
+            Err(MapError::InvalidValueSize {
+                size: 2,
+                expected: 4
+            })
+        );
     }
 
     #[test]
     fn test_new_ok() {
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
-
-        assert!(HashMap::<_, u32, u32>::new(&mut map).is_ok());
+        let map = new_map(new_obj_map());
+        assert!(HashMap::<_, u32, u32>::new(&map).is_ok());
     }
 
     #[test]
     fn test_try_from_ok() {
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
+        let map = new_map(new_obj_map());
+        let map = Map::HashMap(map);
         assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok())
     }
 
     #[test]
     fn test_try_from_ok_lru() {
-        let map = Map {
-            obj: obj::Map {
-                name: "TEST".to_string(),
-                def: bpf_map_def {
-                    map_type: BPF_MAP_TYPE_LRU_HASH as u32,
-                    key_size: 4,
-                    value_size: 4,
-                    max_entries: 1024,
-                    ..Default::default()
-                },
-                section_index: 0,
-                data: Vec::new(),
-            },
-            fd: Some(42),
-            pinned: false,
-        };
-
+        let map_data = || new_map(test_utils::new_obj_map(BPF_MAP_TYPE_LRU_HASH));
+        let map = Map::HashMap(map_data());
+        assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok());
+        let map = Map::LruHashMap(map_data());
         assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok())
     }
 
     #[test]
     fn test_insert_syscall_error() {
-        override_syscall(|_| sys_error(EFAULT));
-
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
+        let mut map = new_map(new_obj_map());
         let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
 
-        assert!(matches!(
+        override_syscall(|_| sys_error(EFAULT));
+
+        assert_matches!(
             hm.insert(1, 42, 0),
-            Err(MapError::SyscallError { call, code: -1, io_error }) if call == "bpf_map_update_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+            Err(MapError::SyscallError(SyscallError { call: "bpf_map_update_elem", io_error })) if io_error.raw_os_error() == Some(EFAULT)
+        );
     }
 
     #[test]
     fn test_insert_ok() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_UPDATE_ELEM,
@@ -318,35 +225,43 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
-        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
-
         assert!(hm.insert(1, 42, 0).is_ok());
     }
 
     #[test]
-    fn test_remove_syscall_error() {
-        override_syscall(|_| sys_error(EFAULT));
-
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
+    fn test_insert_boxed_ok() {
+        let mut map = new_map(new_obj_map());
         let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
 
-        assert!(matches!(
+        override_syscall(|call| match call {
+            Syscall::Bpf {
+                cmd: bpf_cmd::BPF_MAP_UPDATE_ELEM,
+                ..
+            } => Ok(1),
+            _ => sys_error(EFAULT),
+        });
+
+        assert!(hm.insert(Box::new(1), Box::new(42), 0).is_ok());
+    }
+
+    #[test]
+    fn test_remove_syscall_error() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
+        override_syscall(|_| sys_error(EFAULT));
+
+        assert_matches!(
             hm.remove(&1),
-            Err(MapError::SyscallError { call, code: -1, io_error }) if call == "bpf_map_delete_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+            Err(MapError::SyscallError(SyscallError { call: "bpf_map_delete_elem", io_error })) if io_error.raw_os_error() == Some(EFAULT)
+        );
     }
 
     #[test]
     fn test_remove_ok() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_DELETE_ELEM,
@@ -355,34 +270,24 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let mut map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
-        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
-
         assert!(hm.remove(&1).is_ok());
     }
 
     #[test]
     fn test_get_syscall_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|_| sys_error(EFAULT));
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        assert!(matches!(
-            unsafe { hm.get(&1, 0) },
-            Err(MapError::SyscallError { call, code: -1, io_error }) if call == "bpf_map_lookup_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+        assert_matches!(
+            hm.get(&1, 0),
+            Err(MapError::SyscallError(SyscallError { call: "bpf_map_lookup_elem", io_error })) if io_error.raw_os_error() == Some(EFAULT)
+        );
     }
 
     #[test]
     fn test_get_not_found() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_LOOKUP_ELEM,
@@ -390,17 +295,9 @@ mod tests {
             } => sys_error(ENOENT),
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        assert!(matches!(
-            unsafe { hm.get(&1, 0) },
-            Err(MapError::KeyNotFound)
-        ));
+        assert_matches!(hm.get(&1, 0), Err(MapError::KeyNotFound));
     }
 
     fn bpf_key<T: Copy>(attr: &bpf_attr) -> Option<T> {
@@ -422,6 +319,7 @@ mod tests {
 
     #[test]
     fn test_keys_empty() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -429,17 +327,12 @@ mod tests {
             } => sys_error(ENOENT),
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
-        let keys = unsafe { hm.keys() }.collect::<Result<Vec<_>, _>>();
-        assert!(matches!(keys, Ok(ks) if ks.is_empty()))
+        let keys = hm.keys().collect::<Result<Vec<_>, _>>();
+        assert_matches!(keys, Ok(ks) if ks.is_empty())
     }
 
-    fn get_next_key(attr: &bpf_attr) -> SysResult {
+    fn get_next_key(attr: &bpf_attr) -> SysResult<c_long> {
         match bpf_key(attr) {
             None => set_next_key(attr, 10),
             Some(10) => set_next_key(attr, 20),
@@ -451,7 +344,7 @@ mod tests {
         Ok(1)
     }
 
-    fn lookup_elem(attr: &bpf_attr) -> SysResult {
+    fn lookup_elem(attr: &bpf_attr) -> SysResult<c_long> {
         match bpf_key(attr) {
             Some(10) => set_ret(attr, 100),
             Some(20) => set_ret(attr, 200),
@@ -464,7 +357,13 @@ mod tests {
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_keys() {
+        let map = new_map(new_obj_map());
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -473,19 +372,19 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        let keys = unsafe { hm.keys() }.collect::<Result<Vec<_>, _>>().unwrap();
+        let keys = hm.keys().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(&keys, &[10, 20, 30])
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_keys_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -501,25 +400,28 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        let mut keys = unsafe { hm.keys() };
-        assert!(matches!(keys.next(), Some(Ok(10))));
-        assert!(matches!(keys.next(), Some(Ok(20))));
-        assert!(matches!(
+        let mut keys = hm.keys();
+        assert_matches!(keys.next(), Some(Ok(10)));
+        assert_matches!(keys.next(), Some(Ok(20)));
+        assert_matches!(
             keys.next(),
-            Some(Err(MapError::SyscallError { call, .. })) if call == "bpf_map_get_next_key"
-        ));
-        assert!(matches!(keys.next(), None));
+            Some(Err(MapError::SyscallError(SyscallError {
+                call: "bpf_map_get_next_key",
+                io_error: _
+            })))
+        );
+        assert_matches!(keys.next(), None);
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_iter() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -531,18 +433,18 @@ mod tests {
             } => lookup_elem(attr),
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
-        let items = unsafe { hm.iter() }.collect::<Result<Vec<_>, _>>().unwrap();
+        let items = hm.iter().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(&items, &[(10, 100), (20, 200), (30, 300)])
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_iter_key_deleted() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -564,19 +466,19 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        let items = unsafe { hm.iter() }.collect::<Result<Vec<_>, _>>().unwrap();
+        let items = hm.iter().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(&items, &[(10, 100), (30, 300)])
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_iter_key_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -587,7 +489,7 @@ mod tests {
                     Some(10) => set_next_key(attr, 20),
                     Some(20) => return sys_error(EFAULT),
                     Some(30) => return sys_error(ENOENT),
-                    Some(_) => panic!(),
+                    Some(i) => panic!("invalid key {}", i),
                 };
 
                 Ok(1)
@@ -598,25 +500,28 @@ mod tests {
             } => lookup_elem(attr),
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        let mut iter = unsafe { hm.iter() };
-        assert!(matches!(iter.next(), Some(Ok((10, 100)))));
-        assert!(matches!(iter.next(), Some(Ok((20, 200)))));
-        assert!(matches!(
+        let mut iter = hm.iter();
+        assert_matches!(iter.next(), Some(Ok((10, 100))));
+        assert_matches!(iter.next(), Some(Ok((20, 200))));
+        assert_matches!(
             iter.next(),
-            Some(Err(MapError::SyscallError { call, .. })) if call == "bpf_map_get_next_key"
-        ));
-        assert!(matches!(iter.next(), None));
+            Some(Err(MapError::SyscallError(SyscallError {
+                call: "bpf_map_get_next_key",
+                io_error: _
+            })))
+        );
+        assert_matches!(iter.next(), None);
     }
 
     #[test]
+    // Syscall overrides are performing integer-to-pointer conversions, which
+    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
+    // to support stable as well.
+    #[cfg_attr(miri, ignore)]
     fn test_iter_value_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -638,20 +543,18 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = Map {
-            obj: new_obj_map("TEST"),
-            fd: Some(42),
-            pinned: false,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
-        let mut iter = unsafe { hm.iter() };
-        assert!(matches!(iter.next(), Some(Ok((10, 100)))));
-        assert!(matches!(
+        let mut iter = hm.iter();
+        assert_matches!(iter.next(), Some(Ok((10, 100))));
+        assert_matches!(
             iter.next(),
-            Some(Err(MapError::SyscallError { call, .. })) if call == "bpf_map_lookup_elem"
-        ));
-        assert!(matches!(iter.next(), Some(Ok((30, 300)))));
-        assert!(matches!(iter.next(), None));
+            Some(Err(MapError::SyscallError(SyscallError {
+                call: "bpf_map_lookup_elem",
+                io_error: _
+            })))
+        );
+        assert_matches!(iter.next(), Some(Ok((30, 300))));
+        assert_matches!(iter.next(), None);
     }
 }

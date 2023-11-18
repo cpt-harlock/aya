@@ -1,22 +1,23 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::anyhow;
-use std::path::PathBuf;
+use aya_tool::{bindgen, write_to_file};
 
-use aya_gen::{bindgen, write_to_file};
+use crate::codegen::{Architecture, SysrootOptions};
 
-use crate::codegen::{Architecture, Options};
-
-pub fn codegen(opts: &Options) -> Result<(), anyhow::Error> {
-    codegen_internal_btf_bindings(opts)?;
-    codegen_bindings(opts)
+pub fn codegen(opts: &SysrootOptions, libbpf_dir: &Path) -> Result<(), anyhow::Error> {
+    codegen_internal_btf_bindings(libbpf_dir)?;
+    codegen_bindings(opts, libbpf_dir)
 }
 
-fn codegen_internal_btf_bindings(opts: &Options) -> Result<(), anyhow::Error> {
-    let dir = PathBuf::from("aya");
+fn codegen_internal_btf_bindings(libbpf_dir: &Path) -> Result<(), anyhow::Error> {
+    let dir = PathBuf::from("aya-obj");
     let generated = dir.join("src/generated");
+
     let mut bindgen = bindgen::user_builder()
         .clang_arg(format!(
             "-I{}",
-            opts.libbpf_dir
+            libbpf_dir
                 .join("include/uapi")
                 .canonicalize()
                 .unwrap()
@@ -24,17 +25,13 @@ fn codegen_internal_btf_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         ))
         .clang_arg(format!(
             "-I{}",
-            opts.libbpf_dir
+            libbpf_dir
                 .join("include")
                 .canonicalize()
                 .unwrap()
                 .to_string_lossy()
         ))
-        .header(
-            opts.libbpf_dir
-                .join("src/libbpf_internal.h")
-                .to_string_lossy(),
-        )
+        .header(libbpf_dir.join("src/libbpf_internal.h").to_string_lossy())
         .constified_enum_module("bpf_core_relo_kind");
 
     let types = ["bpf_core_relo", "btf_ext_header"];
@@ -49,12 +46,18 @@ fn codegen_internal_btf_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         .to_string();
 
     // write the bindings, with the original helpers removed
-    write_to_file(&generated.join("btf_internal_bindings.rs"), &bindings)?;
+    write_to_file(generated.join("btf_internal_bindings.rs"), &bindings)?;
 
     Ok(())
 }
 
-fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
+fn codegen_bindings(opts: &SysrootOptions, libbpf_dir: &Path) -> Result<(), anyhow::Error> {
+    let SysrootOptions {
+        x86_64_sysroot,
+        aarch64_sysroot,
+        armv7_sysroot,
+        riscv64_sysroot,
+    } = opts;
     let types = [
         // BPF
         "BPF_TYPES",
@@ -65,6 +68,15 @@ fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         "bpf_prog_type",
         "bpf_attach_type",
         "bpf_prog_info",
+        "bpf_map_info",
+        "bpf_link_info",
+        "bpf_link_type",
+        "bpf_btf_info",
+        "bpf_func_info",
+        "bpf_line_info",
+        "bpf_lpm_trie_key",
+        "bpf_cpumap_val",
+        "bpf_devmap_val",
         // BTF
         "btf_header",
         "btf_ext_info",
@@ -76,6 +88,8 @@ fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         "btf_param",
         "btf_var",
         "btf_var_secinfo",
+        "btf_func_linkage",
+        "btf_decl_tag",
         // PERF
         "perf_event_attr",
         "perf_sw_ids",
@@ -107,13 +121,15 @@ fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         "BPF_W",
         "BPF_H",
         "BPF_B",
+        "BPF_F_.*",
         "BPF_JMP",
         "BPF_CALL",
         "SO_ATTACH_BPF",
         "SO_DETACH_BPF",
         // BTF
-        "BTF_KIND_.*",
         "BTF_INT_.*",
+        "BTF_KIND_.*",
+        "BTF_VAR_.*",
         // PERF
         "PERF_FLAG_.*",
         "PERF_EVENT_.*",
@@ -139,43 +155,56 @@ fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
         "TC_H_MIN_PRIORITY",
         "TC_H_MIN_INGRESS",
         "TC_H_MIN_EGRESS",
+        // Ringbuf
+        "BPF_RINGBUF_.*",
     ];
 
-    let dir = PathBuf::from("aya");
+    let dir = PathBuf::from("aya-obj");
     let generated = dir.join("src/generated");
 
     let builder = || {
         bindgen::user_builder()
             .header(dir.join("include/linux_wrapper.h").to_string_lossy())
-            .clang_args(&[
-                "-I",
-                &*opts.libbpf_dir.join("include/uapi").to_string_lossy(),
-            ])
-            .clang_args(&["-I", &*opts.libbpf_dir.join("include").to_string_lossy()])
+            .clang_args(&["-I", &*libbpf_dir.join("include/uapi").to_string_lossy()])
+            .clang_args(&["-I", &*libbpf_dir.join("include").to_string_lossy()])
     };
 
     for arch in Architecture::supported() {
         let mut bindgen = builder();
 
+        // Set target triple. This will set the right flags (which you can see
+        // running clang -target=X  -E - -dM </dev/null)
+        let target = match arch {
+            Architecture::X86_64 => "x86_64-unknown-linux-gnu",
+            Architecture::ARMv7 => "armv7-unknown-linux-gnu",
+            Architecture::AArch64 => "aarch64-unknown-linux-gnu",
+            Architecture::RISCV64 => "riscv64-unknown-linux-gnu",
+        };
+        bindgen = bindgen.clang_args(&["-target", target]);
+
+        // Set the sysroot. This is needed to ensure that the correct arch
+        // specific headers are imported.
+        let sysroot = match arch {
+            Architecture::X86_64 => x86_64_sysroot,
+            Architecture::ARMv7 => armv7_sysroot,
+            Architecture::AArch64 => aarch64_sysroot,
+            Architecture::RISCV64 => riscv64_sysroot,
+        };
+        bindgen = bindgen.clang_args(&["-I", &*sysroot.to_string_lossy()]);
+
         for x in &types {
             bindgen = bindgen.allowlist_type(x);
         }
         for x in &vars {
-            bindgen = bindgen.allowlist_var(x);
+            bindgen = bindgen
+                .allowlist_var(x)
+                .constified_enum("BPF_F_.*")
+                .constified_enum("BTF_KIND_.*")
+                .constified_enum("BTF_VAR_.*")
+                .constified_enum("IFLA_.*")
+                .constified_enum("TCA_.*")
+                .constified_enum("BPF_RINGBUF_.*");
         }
-
-        // FIXME: this stuff is probably debian/ubuntu specific
-        match arch {
-            Architecture::X86_64 => {
-                bindgen = bindgen.clang_args(&["-I", "/usr/include/x86_64-linux-gnu"]);
-            }
-            Architecture::ARMv7 => {
-                bindgen = bindgen.clang_args(&["-I", "/usr/arm-linux-gnueabi/include"]);
-            }
-            Architecture::AArch64 => {
-                bindgen = bindgen.clang_args(&["-I", "/usr/aarch64-linux-gnu/include"]);
-            }
-        };
 
         for x in &types {
             bindgen = bindgen.allowlist_type(x);
@@ -192,7 +221,7 @@ fn codegen_bindings(opts: &Options) -> Result<(), anyhow::Error> {
 
         // write the bindings, with the original helpers removed
         write_to_file(
-            &generated.join(format!("linux_bindings_{}.rs", arch)),
+            generated.join(format!("linux_bindings_{arch}.rs")),
             &bindings.to_string(),
         )?;
     }

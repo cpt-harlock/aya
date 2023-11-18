@@ -1,14 +1,11 @@
 //! A hash map of kernel or user space stack traces.
 //!
 //! See [`StackTraceMap`] for documentation and examples.
-use std::{
-    collections::BTreeMap, convert::TryFrom, fs, io, mem, ops::Deref, path::Path, str::FromStr,
-};
+use std::{borrow::Borrow, fs, io, mem, os::fd::AsFd as _, path::Path, str::FromStr};
 
 use crate::{
-    generated::bpf_map_type::BPF_MAP_TYPE_STACK_TRACE,
-    maps::{IterableMap, Map, MapError, MapIter, MapKeys, MapRef, MapRefMut},
-    sys::bpf_map_lookup_elem_ptr,
+    maps::{IterableMap, MapData, MapError, MapIter, MapKeys},
+    sys::{bpf_map_lookup_elem_ptr, SyscallError},
 };
 
 /// A hash map of kernel or user space stack traces.
@@ -37,9 +34,8 @@ use crate::{
 /// # let bpf = aya::Bpf::load(&[])?;
 /// use aya::maps::StackTraceMap;
 /// use aya::util::kernel_symbols;
-/// use std::convert::TryFrom;
 ///
-/// let mut stack_traces = StackTraceMap::try_from(bpf.map("STACK_TRACES")?)?;
+/// let mut stack_traces = StackTraceMap::try_from(bpf.map("STACK_TRACES").unwrap())?;
 /// // load kernel symbols from /proc/kallsyms
 /// let ksyms = kernel_symbols()?;
 ///
@@ -50,15 +46,19 @@ use crate::{
 /// // here we resolve symbol names using kernel symbols. If this was a user space stack (for
 /// // example captured from a uprobe), you'd have to load the symbols using some other mechanism
 /// // (eg loading the target binary debuginfo)
-/// for frame in stack_trace.resolve(&ksyms).frames() {
-///     println!(
-///         "{:#x} {}",
-///         frame.ip,
-///         frame
-///             .symbol_name
-///             .as_ref()
-///             .unwrap_or(&"[unknown symbol name]".to_owned())
-///     );
+/// for frame in stack_trace.frames() {
+///     if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
+///         println!(
+///             "{:#x} {}",
+///             frame.ip,
+///             sym
+///         );
+///     } else {
+///         println!(
+///             "{:#x}",
+///             frame.ip
+///         );
+///     }
 /// }
 ///
 /// # Ok::<(), Error>(())
@@ -67,39 +67,30 @@ use crate::{
 #[derive(Debug)]
 #[doc(alias = "BPF_MAP_TYPE_STACK_TRACE")]
 pub struct StackTraceMap<T> {
-    inner: T,
+    pub(crate) inner: T,
     max_stack_depth: usize,
 }
 
-impl<T: Deref<Target = Map>> StackTraceMap<T> {
-    fn new(map: T) -> Result<StackTraceMap<T>, MapError> {
-        let map_type = map.obj.def.map_type;
-        if map_type != BPF_MAP_TYPE_STACK_TRACE as u32 {
-            return Err(MapError::InvalidMapType {
-                map_type: map_type as u32,
-            });
-        }
+impl<T: Borrow<MapData>> StackTraceMap<T> {
+    pub(crate) fn new(map: T) -> Result<Self, MapError> {
+        let data = map.borrow();
         let expected = mem::size_of::<u32>();
-        let size = map.obj.def.key_size as usize;
+        let size = data.obj.key_size() as usize;
         if size != expected {
             return Err(MapError::InvalidKeySize { size, expected });
         }
 
         let max_stack_depth =
-            sysctl::<usize>("kernel/perf_event_max_stack").map_err(|io_error| {
-                MapError::SyscallError {
-                    call: "sysctl".to_owned(),
-                    code: -1,
-                    io_error,
-                }
+            sysctl::<usize>("kernel/perf_event_max_stack").map_err(|io_error| SyscallError {
+                call: "sysctl",
+                io_error,
             })?;
-        let size = map.obj.def.value_size as usize;
+        let size = data.obj.value_size() as usize;
         if size > max_stack_depth * mem::size_of::<u64>() {
             return Err(MapError::InvalidValueSize { size, expected });
         }
-        let _fd = map.fd_or_err()?;
 
-        Ok(StackTraceMap {
+        Ok(Self {
             inner: map,
             max_stack_depth,
         })
@@ -112,24 +103,20 @@ impl<T: Deref<Target = Map>> StackTraceMap<T> {
     /// Returns [`MapError::KeyNotFound`] if there is no stack trace with the
     /// given `stack_id`, or [`MapError::SyscallError`] if `bpf_map_lookup_elem` fails.
     pub fn get(&self, stack_id: &u32, flags: u64) -> Result<StackTrace, MapError> {
-        let fd = self.inner.fd_or_err()?;
+        let fd = self.inner.borrow().fd().as_fd();
 
         let mut frames = vec![0; self.max_stack_depth];
-        bpf_map_lookup_elem_ptr(fd, stack_id, frames.as_mut_ptr(), flags)
-            .map_err(|(code, io_error)| MapError::SyscallError {
-                call: "bpf_map_lookup_elem".to_owned(),
-                code,
+        bpf_map_lookup_elem_ptr(fd, Some(stack_id), frames.as_mut_ptr(), flags)
+            .map_err(|(_, io_error)| SyscallError {
+                call: "bpf_map_lookup_elem",
                 io_error,
             })?
             .ok_or(MapError::KeyNotFound)?;
 
         let frames = frames
-            .drain(..)
+            .into_iter()
             .take_while(|ip| *ip != 0)
-            .map(|ip| StackFrame {
-                ip,
-                symbol_name: None,
-            })
+            .map(|ip| StackFrame { ip })
             .collect::<Vec<_>>();
 
         Ok(StackTrace {
@@ -140,46 +127,30 @@ impl<T: Deref<Target = Map>> StackTraceMap<T> {
 
     /// An iterator visiting all (`stack_id`, `stack_trace`) pairs in arbitrary order. The
     /// iterator item type is `Result<(u32, StackTrace), MapError>`.
-    pub fn iter(&self) -> MapIter<'_, u32, StackTrace> {
+    pub fn iter(&self) -> MapIter<'_, u32, StackTrace, Self> {
         MapIter::new(self)
     }
 
     /// An iterator visiting all the stack_ids in arbitrary order. The iterator element
     /// type is `Result<u32, MapError>`.
     pub fn stack_ids(&self) -> MapKeys<'_, u32> {
-        MapKeys::new(&self.inner)
+        MapKeys::new(self.inner.borrow())
     }
 }
 
-impl<T: Deref<Target = Map>> IterableMap<u32, StackTrace> for StackTraceMap<T> {
-    fn map(&self) -> &Map {
-        &self.inner
+impl<T: Borrow<MapData>> IterableMap<u32, StackTrace> for StackTraceMap<T> {
+    fn map(&self) -> &MapData {
+        self.inner.borrow()
     }
 
-    unsafe fn get(&self, index: &u32) -> Result<StackTrace, MapError> {
+    fn get(&self, index: &u32) -> Result<StackTrace, MapError> {
         self.get(index, 0)
     }
 }
 
-impl TryFrom<MapRef> for StackTraceMap<MapRef> {
-    type Error = MapError;
-
-    fn try_from(a: MapRef) -> Result<StackTraceMap<MapRef>, MapError> {
-        StackTraceMap::new(a)
-    }
-}
-
-impl TryFrom<MapRefMut> for StackTraceMap<MapRefMut> {
-    type Error = MapError;
-
-    fn try_from(a: MapRefMut) -> Result<StackTraceMap<MapRefMut>, MapError> {
-        StackTraceMap::new(a)
-    }
-}
-
-impl<'a, T: Deref<Target = Map>> IntoIterator for &'a StackTraceMap<T> {
+impl<'a, T: Borrow<MapData>> IntoIterator for &'a StackTraceMap<T> {
     type Item = Result<(u32, StackTrace), MapError>;
-    type IntoIter = MapIter<'a, u32, StackTrace>;
+    type IntoIter = MapIter<'a, u32, StackTrace, StackTraceMap<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -196,22 +167,6 @@ pub struct StackTrace {
 }
 
 impl StackTrace {
-    /// Resolves symbol names using the given symbol map.
-    ///
-    /// You can use [`util::kernel_symbols()`](crate::util::kernel_symbols) to load kernel symbols. For
-    /// user-space traces you need to provide the symbols, for example loading
-    /// them from debug info.
-    pub fn resolve(&mut self, symbols: &BTreeMap<u64, String>) -> &StackTrace {
-        for frame in self.frames.iter_mut() {
-            frame.symbol_name = symbols
-                .range(..=frame.ip)
-                .next_back()
-                .map(|(_, s)| s.clone())
-        }
-
-        self
-    }
-
     /// Returns the frames in this stack trace.
     pub fn frames(&self) -> &[StackFrame] {
         &self.frames
@@ -222,11 +177,6 @@ impl StackTrace {
 pub struct StackFrame {
     /// The instruction pointer of this frame.
     pub ip: u64,
-    /// The symbol name corresponding to the start of this frame.
-    ///
-    /// Set to `Some()` if the frame address can be found in the symbols passed
-    /// to [`StackTrace::resolve`].
-    pub symbol_name: Option<String>,
 }
 
 fn sysctl<T: FromStr>(key: &str) -> Result<T, io::Error> {

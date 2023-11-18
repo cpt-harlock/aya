@@ -12,10 +12,8 @@
 pub use ad::*;
 // OD = OS dependent
 pub use od::*;
-// PWD = Pointer Width Dependent
-pub use pwd::*;
 
-#[cfg(any(target_arch = "bpf"))]
+#[cfg(target_arch = "bpf")]
 mod ad {
     pub type c_int = i32;
     pub type c_uint = u32;
@@ -24,6 +22,9 @@ mod ad {
     pub type c_char = super::c_uchar;
 
     #[cfg(bpf_target_arch = "aarch64")]
+    pub type c_char = super::c_uchar;
+
+    #[cfg(bpf_target_arch = "riscv64")]
     pub type c_char = super::c_uchar;
 
     #[cfg(any(bpf_target_arch = "x86", bpf_target_arch = "x86_64"))]
@@ -46,7 +47,7 @@ mod ad {
     target_arch = "riscv64"
 ))]
 mod ad {
-    pub type c_char = ::c_uchar;
+    pub type c_char = super::c_uchar;
 
     pub type c_int = i32;
     pub type c_uint = u32;
@@ -63,7 +64,7 @@ mod ad {
     target_arch = "xtensa"
 ))]
 mod ad {
-    pub type c_char = ::c_schar;
+    pub type c_char = super::c_schar;
 
     pub type c_int = i32;
     pub type c_uint = u32;
@@ -71,7 +72,7 @@ mod ad {
 
 #[cfg(target_arch = "msp430")]
 mod ad {
-    pub type c_char = ::c_uchar;
+    pub type c_char = super::c_uchar;
 
     pub type c_int = i16;
     pub type c_uint = u16;
@@ -102,12 +103,6 @@ mod od {
     pub type c_long = i64;
     pub type c_ulong = u64;
 }
-
-#[cfg(target_pointer_width = "32")]
-mod pwd {}
-
-#[cfg(target_pointer_width = "64")]
-mod pwd {}
 
 pub type int8_t = i8;
 pub type int16_t = i16;
